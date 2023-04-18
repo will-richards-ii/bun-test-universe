@@ -74,7 +74,10 @@ const StringHashMapUnamanged = bun.StringHashMapUnmanaged;
 const ObjectPool = @import("./pool.zig").ObjectPool;
 const NodeFallbackModules = @import("./node_fallbacks.zig");
 
-const RefExprMap = std.ArrayHashMapUnmanaged(Ref, Expr, RefHashCtx, false);
+const DeferredImportNamespace = struct {
+    namespace: LocRef,
+    import_record_id: u32,
+};
 
 const SkipTypeParameterResult = enum {
     did_not_skip_anything,
@@ -2657,7 +2660,7 @@ pub const Parser = struct {
 
         // Used when bundling node_modules
         enable_legacy_bundling: bool = false,
-        transform_require_to_import: bool = true,
+        legacy_transform_require_to_import: bool = true,
 
         module_type: options.ModuleType = .unknown,
 
@@ -2739,7 +2742,7 @@ pub const Parser = struct {
             _ = p.addImportRecord(
                 .require,
                 logger.Loc{ .start = 0 },
-                p.options.jsx.import_source,
+                p.options.jsx.importSource(),
             );
             // Ensure we have both classic and automatic
             // This is to handle cases where they use fragments in the automatic runtime
@@ -2954,6 +2957,45 @@ pub const Parser = struct {
                         sliced.items[0] = stmt;
                         try p.appendPart(parts_list, sliced.items);
                     },
+
+                    // Hoist functions to the top in the output
+                    // This is normally done by the JS parser, but we need to do it here
+                    // incase we have CommonJS exports converted to ESM exports there are assignments
+                    // to the exports object that need to be hoisted.
+                    .s_function => {
+                        var sliced = try ListManaged(Stmt).initCapacity(p.allocator, 1);
+                        sliced.items.len = 1;
+                        sliced.items[0] = stmt;
+                        // since we convert top-level function statements to look like this:
+                        //
+                        //   let foo = function () { ... }
+                        //
+                        // we have to hoist them to the top of the file, even when not bundling
+                        //
+                        // we might also need to do this for classes but i'm not sure yet.
+                        try p.appendPart(&before, sliced.items);
+                    },
+                    .s_class => |class| {
+                        // Move class export statements to the top of the file if we can
+                        // This automatically resolves some cyclical import issues
+                        // https://github.com/kysely-org/kysely/issues/412
+                        var list = if (!p.options.bundle and class.is_export and class.class.extends == null) &before else &parts;
+                        var sliced = try ListManaged(Stmt).initCapacity(p.allocator, 1);
+                        sliced.items.len = 1;
+                        sliced.items[0] = stmt;
+                        try p.appendPart(list, sliced.items);
+                    },
+                    .s_export_default => |value| {
+                        // We move export default statements when we can
+                        // This automatically resolves some cyclical import issues in packages like luxon
+                        // https://github.com/oven-sh/bun/issues/1961
+                        var list = if (!p.options.bundle and value.canBeMovedAround()) &before else &parts;
+                        var sliced = try ListManaged(Stmt).initCapacity(p.allocator, 1);
+                        sliced.items.len = 1;
+                        sliced.items[0] = stmt;
+                        try p.appendPart(list, sliced.items);
+                    },
+
                     else => {
                         var sliced = try ListManaged(Stmt).initCapacity(p.allocator, 1);
                         sliced.items.len = 1;
@@ -3013,13 +3055,43 @@ pub const Parser = struct {
         var did_import_fast_refresh = false;
         _ = did_import_fast_refresh;
 
-        if (comptime FeatureFlags.commonjs_to_esm) {
+        if (comptime FeatureFlags.unwrap_commonjs_to_esm) {
+            if (p.imports_to_convert_from_require.items.len > 0) {
+                var all_stmts = p.allocator.alloc(Stmt, p.imports_to_convert_from_require.items.len) catch unreachable;
+                before.ensureUnusedCapacity(p.imports_to_convert_from_require.items.len) catch unreachable;
+
+                var remaining_stmts = all_stmts;
+
+                for (p.imports_to_convert_from_require.items) |deferred_import| {
+                    var stmts_ = remaining_stmts[0..1];
+                    remaining_stmts = remaining_stmts[1..];
+
+                    stmts_[0] = Stmt.alloc(
+                        S.Import,
+                        S.Import{
+                            .star_name_loc = deferred_import.namespace.loc,
+                            .import_record_index = deferred_import.import_record_id,
+                            .namespace_ref = deferred_import.namespace.ref.?,
+                        },
+                        deferred_import.namespace.loc,
+                    );
+                    var declared_symbols = DeclaredSymbol.List.initCapacity(p.allocator, 1) catch unreachable;
+                    declared_symbols.appendAssumeCapacity(.{ .ref = deferred_import.namespace.ref.?, .is_top_level = true });
+                    before.appendAssumeCapacity(.{
+                        .stmts = stmts_,
+                        .declared_symbols = declared_symbols,
+                        .can_be_removed_if_unused = p.stmtsCanBeRemovedIfUnused(stmts_),
+                    });
+                }
+                std.debug.assert(remaining_stmts.len == 0);
+            }
+
             if (p.commonjs_named_exports.count() > 0) {
                 var export_refs = p.commonjs_named_exports.values();
                 var export_names = p.commonjs_named_exports.keys();
 
                 if (!p.commonjs_named_exports_deoptimized) {
-                    // We make this safe by doing toCommonJS() at runtimes
+                    // We make this safe by doing toCommonJS() at runtime
                     for (export_refs, export_names) |*export_ref, alias| {
                         if (export_ref.needs_decl) {
                             var this_stmts = p.allocator.alloc(Stmt, 2) catch unreachable;
@@ -3035,6 +3107,7 @@ pub const Parser = struct {
                                 S.Local{
                                     .kind = .k_var,
                                     .is_export = false,
+                                    .was_commonjs_export = true,
                                     .decls = decls,
                                 },
                                 export_ref.loc_ref.loc,
@@ -3058,7 +3131,8 @@ pub const Parser = struct {
                             before.append(.{
                                 .stmts = this_stmts,
                                 .declared_symbols = declared_symbols,
-                                .can_be_removed_if_unused = true,
+                                .tag = .commonjs_named_export,
+                                .can_be_removed_if_unused = p.stmtsCanBeRemovedIfUnused(this_stmts),
                             }) catch unreachable;
                         }
                     }
@@ -3076,7 +3150,7 @@ pub const Parser = struct {
             //   CommonJS:
             //
             //    if (process.env.NODE_ENV === 'production')
-            //        module.exports = require('./foo.prod.js')
+            //         module.exports = require('./foo.prod.js')
             //     else
             //         module.exports = require('./foo.dev.js')
             //
@@ -3096,7 +3170,7 @@ pub const Parser = struct {
                             const left = bin.left;
                             const right = bin.right;
                             if (bin.op == .bin_assign and
-                                right.data == .e_require and
+                                right.data == .e_require_string and
                                 left.data == .e_dot and
                                 strings.eqlComptime(left.data.e_dot.name, "exports") and
                                 left.data.e_dot.target.data == .e_identifier and
@@ -3106,7 +3180,7 @@ pub const Parser = struct {
                                     .ast = js_ast.Ast{
                                         .allocator = p.allocator,
                                         .import_records = ImportRecord.List.init(p.import_records.items),
-                                        .redirect_import_record_index = right.data.e_require.import_record_index,
+                                        .redirect_import_record_index = right.data.e_require_string.import_record_index,
                                         .named_imports = p.named_imports,
                                         .named_exports = p.named_exports,
                                     },
@@ -3132,22 +3206,83 @@ pub const Parser = struct {
                         else => {},
                     }
                 }
+            } else if (p.commonjs_named_exports_deoptimized and
+                p.unwrap_all_requires and
+                p.imports_to_convert_from_require.items.len == 1 and
+                p.import_records.items.len == 1 and
+                part.stmts.len < 4 and
+                p.symbols.items[p.module_ref.innerIndex()].use_count_estimate == 1)
+            {
+                // Specially handle modules shaped like this:
+                //
+                //    doSomeStuff();
+                //    module.exports = require('./foo.js');
+                //
+                for (part.stmts) |*stmt| {
+                    if (stmt.data == .s_expr) {
+                        const value: Expr = stmt.data.s_expr.value;
+
+                        if (value.data == .e_binary) {
+                            const bin = value.data.e_binary;
+                            const left = bin.left;
+                            const right = bin.right;
+                            if (bin.op == .bin_assign and
+                                right.data == .e_require_string and
+                                left.data == .e_dot and
+                                strings.eqlComptime(left.data.e_dot.name, "exports") and
+                                left.data.e_dot.target.data == .e_identifier and
+                                left.data.e_dot.target.data.e_identifier.ref.eql(p.module_ref))
+                            {
+                                p.export_star_import_records.append(
+                                    p.allocator,
+                                    right.data.e_require_string.import_record_index,
+                                ) catch unreachable;
+                                stmt.* = Stmt.alloc(
+                                    S.ExportStar,
+                                    S.ExportStar{
+                                        .import_record_index = right.data.e_require_string.import_record_index,
+                                        .namespace_ref = p.imports_to_convert_from_require.items[
+                                            right.data.e_require_string.unwrapped_id
+                                        ].namespace.ref.?,
+                                    },
+                                    stmt.loc,
+                                );
+                                part.import_record_indices.push(p.allocator, right.data.e_require_string.import_record_index) catch unreachable;
+                                p.symbols.items[p.module_ref.innerIndex()].use_count_estimate = 0;
+                                _ = part.symbol_uses.swapRemove(p.module_ref);
+                                if (p.esm_export_keyword.len == 0) {
+                                    p.esm_export_keyword.loc = stmt.loc;
+                                    p.esm_export_keyword.len = 5;
+                                }
+                                p.commonjs_named_exports_deoptimized = false;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
 
         // Analyze cross-part dependencies for tree shaking and code splitting
         var exports_kind = js_ast.ExportsKind.none;
-        const uses_exports_ref = p.symbols.items[p.exports_ref.innerIndex()].use_count_estimate > 0;
+        const exports_ref_usage_count = p.symbols.items[p.exports_ref.innerIndex()].use_count_estimate;
+        const uses_exports_ref = exports_ref_usage_count > 0;
+        if (uses_exports_ref and p.commonjs_named_exports.count() > 0) {
+            p.deoptimizeCommonJSNamedExports();
+        }
+
         const uses_module_ref = p.symbols.items[p.module_ref.innerIndex()].use_count_estimate > 0;
 
         var wrapper_expr: ?Expr = null;
 
-        if (p.esm_export_keyword.len > 0 or p.top_level_await_keyword.len > 0) {
+        if (p.isDeoptimizedCommonJS()) {
+            exports_kind = .cjs;
+        } else if (p.esm_export_keyword.len > 0 or p.top_level_await_keyword.len > 0) {
             exports_kind = .esm;
         } else if (uses_exports_ref or uses_module_ref or p.has_top_level_return) {
             exports_kind = .cjs;
             if (!p.options.bundle) {
-                if (p.options.transform_require_to_import or (p.options.features.dynamic_require and !p.options.enable_legacy_bundling)) {
+                if (p.options.legacy_transform_require_to_import or (p.options.features.dynamic_require and !p.options.enable_legacy_bundling)) {
                     var args = p.allocator.alloc(Expr, 2) catch unreachable;
 
                     if (p.runtime_imports.__exportDefault == null and p.has_export_default) {
@@ -3182,6 +3317,10 @@ pub const Parser = struct {
                     exports_kind = .esm;
                 },
             }
+        }
+
+        if (exports_kind == .esm and p.commonjs_named_exports.count() > 0 and !p.unwrap_all_requires) {
+            exports_kind = .esm_with_dynamic_fallback_from_cjs;
         }
 
         // Auto inject jest globals into the test file
@@ -3418,7 +3557,7 @@ pub const Parser = struct {
         //                             if (use_automatic_identifier) {
         //                                 break :brk automatic_identifier;
         //                             } else if (p.options.features.dynamic_require) {
-        //                                 break :brk p.newExpr(E.Require{ .import_record_index = import_record_id }, loc);
+        //                                 break :brk p.newExpr(E.RequireString{ .import_record_index = import_record_id }, loc);
         //                             } else {
         //                                 require_call_args_base[require_call_args_i] = automatic_identifier;
         //                                 require_call_args_i += 1;
@@ -3489,7 +3628,7 @@ pub const Parser = struct {
         //                         // }
 
         //                         p.import_records.items[import_record_id].tag = .jsx_import;
-        //                         if (dot_call_target.data != .e_require) {
+        //                         if (dot_call_target.data != .e_require_string) {
         //                             // When everything is CommonJS
         //                             // We import JSX like this:
         //                             // var {jsxDev} = require("react/jsx-dev")
@@ -3527,7 +3666,7 @@ pub const Parser = struct {
         //                             if (p.options.can_import_from_bundle or p.options.enable_legacy_bundling or !p.options.features.allow_runtime) {
         //                                 break :brk classic_identifier;
         //                             } else if (p.options.features.dynamic_require) {
-        //                                 break :brk p.newExpr(E.Require{ .import_record_index = import_record_id }, loc);
+        //                                 break :brk p.newExpr(E.RequireString{ .import_record_index = import_record_id }, loc);
         //                             } else {
         //                                 const require_call_args_start = require_call_args_i;
         //                                 require_call_args_base[require_call_args_i] = classic_identifier;
@@ -3572,7 +3711,7 @@ pub const Parser = struct {
         //                             decl_i += 1;
         //                         }
 
-        //                         if (dot_call_target.data != .e_require) {
+        //                         if (dot_call_target.data != .e_require_string) {
         //                             jsx_part_stmts[stmt_i] = p.s(S.Import{
         //                                 .namespace_ref = classic_namespace_ref,
         //                                 .star_name_loc = loc,
@@ -3798,8 +3937,6 @@ pub const Parser = struct {
         //     if (p.options.enable_legacy_bundling) p.resolveBundlingSymbols();
         // }
 
-        const has_cjs_imports = p.cjs_import_stmts.items.len > 0 and p.options.transform_require_to_import;
-
         // if (!p.options.bundle) {
         //     // "did they actually use require?"
         //     // well, if they didn't, in the linker later, we might need to inject it
@@ -3893,12 +4030,12 @@ pub const Parser = struct {
         //     }
         // }
 
-        if (has_cjs_imports) {
-            var import_records = try bun.BabyList(u32).initCapacity(p.allocator, p.cjs_import_stmts.items.len);
+        if (p.legacy_cjs_import_stmts.items.len > 0 and p.options.legacy_transform_require_to_import) {
+            var import_records = try bun.BabyList(u32).initCapacity(p.allocator, p.legacy_cjs_import_stmts.items.len);
             var declared_symbols = DeclaredSymbol.List{};
-            try declared_symbols.ensureTotalCapacity(p.allocator, p.cjs_import_stmts.items.len);
+            try declared_symbols.ensureTotalCapacity(p.allocator, p.legacy_cjs_import_stmts.items.len);
 
-            for (p.cjs_import_stmts.items) |entry| {
+            for (p.legacy_cjs_import_stmts.items) |entry| {
                 const import_statement: *S.Import = entry.data.s_import;
                 import_records.appendAssumeCapacity(import_statement.import_record_index);
                 declared_symbols.appendAssumeCapacity(.{
@@ -3908,7 +4045,7 @@ pub const Parser = struct {
             }
 
             before.append(js_ast.Part{
-                .stmts = p.cjs_import_stmts.items,
+                .stmts = p.legacy_cjs_import_stmts.items,
                 .declared_symbols = declared_symbols,
                 .import_record_indices = import_records,
                 .tag = .cjs_imports,
@@ -3959,7 +4096,7 @@ pub const Parser = struct {
 
             if (runtime_import_names.len > 0) {
                 p.generateImportStmt(
-                    p.options.jsx.import_source,
+                    p.options.jsx.importSource(),
                     runtime_import_names,
                     &before,
                     &p.jsx_imports,
@@ -4253,10 +4390,14 @@ pub const KnownGlobal = enum {
     Date,
     Set,
     Map,
+    Headers,
+    Response,
+    TextEncoder,
+    TextDecoder,
 
     pub const map = bun.ComptimeEnumMap(KnownGlobal);
 
-    pub fn maybeMarkConstructorAsPure(e: *E.New, symbols: []const Symbol) void {
+    pub noinline fn maybeMarkConstructorAsPure(e: *E.New, symbols: []const Symbol) void {
         const id = if (e.target.data == .e_identifier) e.target.data.e_identifier.ref else return;
         const symbol = &symbols[id.innerIndex()];
         if (symbol.kind != .unbound)
@@ -4271,11 +4412,12 @@ pub const KnownGlobal = enum {
                 if (n == 0) {
                     // "new WeakSet()" is pure
                     e.can_be_unwrapped_if_unused = true;
+
                     return;
                 }
 
                 if (n == 1) {
-                    switch (e.args[0].data) {
+                    switch (e.args.ptr[0].data) {
                         .e_null, .e_undefined => {
                             // "new WeakSet(null)" is pure
                             // "new WeakSet(void 0)" is pure
@@ -4301,11 +4443,12 @@ pub const KnownGlobal = enum {
                 if (n == 0) {
                     // "new Date()" is pure
                     e.can_be_unwrapped_if_unused = true;
+
                     return;
                 }
 
                 if (n == 1) {
-                    switch (e.args[0].knownPrimitiveType()) {
+                    switch (e.args.ptr[0].knownPrimitive()) {
                         .null, .undefined, .boolean, .number, .string => {
                             // "new Date('')" is pure
                             // "new Date(0)" is pure
@@ -4333,7 +4476,7 @@ pub const KnownGlobal = enum {
                 }
 
                 if (n == 1) {
-                    switch (e.args[0].data) {
+                    switch (e.args.ptr[0].data) {
                         .e_array, .e_null, .e_undefined => {
                             // "new Set([a, b, c])" is pure
                             // "new Set(null)" is pure
@@ -4347,6 +4490,60 @@ pub const KnownGlobal = enum {
                 }
             },
 
+            .Headers => {
+                const n = e.args.len;
+
+                if (n == 0) {
+                    // "new Headers()" is pure
+                    e.can_be_unwrapped_if_unused = true;
+
+                    return;
+                }
+            },
+
+            .Response => {
+                const n = e.args.len;
+
+                if (n == 0) {
+                    // "new Response()" is pure
+                    e.can_be_unwrapped_if_unused = true;
+
+                    return;
+                }
+
+                if (n == 1) {
+                    switch (e.args.ptr[0].knownPrimitive()) {
+                        .null, .undefined, .boolean, .number, .string => {
+                            // "new Response('')" is pure
+                            // "new Response(0)" is pure
+                            // "new Response(null)" is pure
+                            // "new Response(true)" is pure
+                            // "new Response(false)" is pure
+                            // "new Response(undefined)" is pure
+
+                            e.can_be_unwrapped_if_unused = true;
+                        },
+                        else => {
+                            // "new Response(x)" is impure
+                        },
+                    }
+                }
+            },
+            .TextDecoder, .TextEncoder => {
+                const n = e.args.len;
+
+                if (n == 0) {
+                    // "new TextEncoder()" is pure
+                    // "new TextDecoder()" is pure
+                    e.can_be_unwrapped_if_unused = true;
+
+                    return;
+                }
+
+                // We _could_ validate the encoding argument
+                // But let's not bother
+            },
+
             .Map => {
                 const n = e.args.len;
 
@@ -4357,7 +4554,7 @@ pub const KnownGlobal = enum {
                 }
 
                 if (n == 1) {
-                    switch (e.args[0].data) {
+                    switch (e.args.ptr[0].data) {
                         .e_null, .e_undefined => {
                             // "new Map(null)" is pure
                             // "new Map(void 0)" is pure
@@ -4365,7 +4562,7 @@ pub const KnownGlobal = enum {
                         },
                         .e_array => |array| {
                             var all_items_are_arrays = true;
-                            for (array.items) |item| {
+                            for (array.items.slice()) |item| {
                                 if (item.data != .e_array) {
                                     all_items_are_arrays = false;
                                     break;
@@ -4499,7 +4696,7 @@ fn NewParser_(
 
         has_called_runtime: bool = false,
 
-        cjs_import_stmts: std.ArrayList(Stmt),
+        legacy_cjs_import_stmts: std.ArrayList(Stmt),
 
         injected_define_symbols: List(Ref) = .{},
         symbol_uses: js_ast.Part.SymbolUseMap = .{},
@@ -4507,9 +4704,14 @@ fn NewParser_(
         declared_symbols_for_reuse: DeclaredSymbol.List = .{},
         runtime_imports: RuntimeImports = RuntimeImports{},
 
+        /// Used with unwrap_commonjs_packages
+        imports_to_convert_from_require: List(DeferredImportNamespace) = .{},
+        unwrap_all_requires: bool = false,
+
         commonjs_named_exports: js_ast.Ast.CommonJSNamedExports = .{},
         commonjs_named_exports_deoptimized: bool = false,
         commonjs_named_exports_needs_conversion: u32 = std.math.maxInt(u32),
+        had_commonjs_named_exports_this_visit: bool = false,
 
         parse_pass_symbol_uses: ParsePassSymbolUsageType = undefined,
         // duplicate_case_checker: void,
@@ -4751,7 +4953,7 @@ fn NewParser_(
 
         scope_order_to_visit: []ScopeOrder = &([_]ScopeOrder{}),
 
-        const_values: RefExprMap = .{},
+        const_values: js_ast.Ast.ConstValuesMap = .{},
 
         pub fn transposeImport(p: *P, arg: Expr, state: anytype) Expr {
             // The argument must be a string
@@ -4798,10 +5000,13 @@ fn NewParser_(
                 const import_record_index = p.addImportRecord(.require, arg.loc, arg.data.e_string.string(p.allocator) catch unreachable);
                 p.import_records.items[import_record_index].handles_import_errors = p.fn_or_arrow_data_visit.try_body_count != 0;
                 p.import_records_for_current_part.append(p.allocator, import_record_index) catch unreachable;
-                return p.newExpr(E.RequireOrRequireResolve{
-                    .import_record_index = Ref.toInt(import_record_index),
-                    // .leading_interior_comments = arg.getString().
-                }, arg.loc);
+                return p.newExpr(
+                    E.RequireResolveString{
+                        .import_record_index = Ref.toInt(import_record_index),
+                        // .leading_interior_comments = arg.getString().
+                    },
+                    arg.loc,
+                );
             }
 
             if (p.options.warn_about_unbundled_modules) {
@@ -4825,13 +5030,53 @@ fn NewParser_(
                     }
 
                     const pathname = str.string(p.allocator) catch unreachable;
+                    const path = fs.Path.init(pathname);
 
-                    const import_record_index = p.addImportRecord(.require, arg.loc, pathname);
-                    p.import_records.items[import_record_index].handles_import_errors = p.fn_or_arrow_data_visit.try_body_count != 0;
+                    const handles_import_errors = p.fn_or_arrow_data_visit.try_body_count != 0;
+
+                    if (
+                    // For unwrapping CommonJS into ESM to fully work
+                    // we must also unwrap requires into imports.
+                    (p.unwrap_all_requires or p.options.features.shouldUnwrapRequire(path.packageName() orelse "")) and
+
+                        // We cannot unwrap a require wrapped in a try/catch because
+                        // import statements cannot be wrapped in a try/catch and
+                        // require cannot return a promise.
+                        !handles_import_errors)
+                    {
+                        const import_record_index = p.addImportRecordByRangeAndPath(.stmt, p.source.rangeOfString(arg.loc), path);
+                        p.import_records.items[import_record_index].handles_import_errors = handles_import_errors;
+
+                        // Note that this symbol may be completely removed later.
+                        var path_name = fs.PathName.init(strings.append(p.allocator, "import_", path.text) catch unreachable);
+                        const name = path_name.nonUniqueNameString(p.allocator) catch unreachable;
+                        const namespace_ref = p.newSymbol(.other, name) catch unreachable;
+
+                        p.imports_to_convert_from_require.append(p.allocator, .{
+                            .namespace = .{
+                                .ref = namespace_ref,
+                                .loc = arg.loc,
+                            },
+                            .import_record_id = import_record_index,
+                        }) catch unreachable;
+                        p.import_items_for_namespace.put(p.allocator, namespace_ref, ImportItemForNamespaceMap.init(p.allocator)) catch unreachable;
+                        p.ignoreUsage(p.require_ref);
+
+                        return p.newExpr(
+                            E.RequireString{
+                                .import_record_index = import_record_index,
+                                .unwrapped_id = @intCast(u32, p.imports_to_convert_from_require.items.len - 1),
+                            },
+                            arg.loc,
+                        );
+                    }
+
+                    const import_record_index = p.addImportRecordByRangeAndPath(.require, p.source.rangeOfString(arg.loc), path);
+                    p.import_records.items[import_record_index].handles_import_errors = handles_import_errors;
                     p.import_records_for_current_part.append(p.allocator, import_record_index) catch unreachable;
 
-                    if (!p.options.transform_require_to_import) {
-                        return p.newExpr(E.Require{ .import_record_index = import_record_index }, arg.loc);
+                    if (!p.options.legacy_transform_require_to_import) {
+                        return p.newExpr(E.RequireString{ .import_record_index = import_record_index }, arg.loc);
                     }
 
                     p.import_records.items[import_record_index].was_originally_require = true;
@@ -4852,13 +5097,13 @@ fn NewParser_(
                         .{
                             symbol_name,
                             bun.fmt.hexIntLower(hash_value),
-                            p.cjs_import_stmts.items.len,
+                            p.legacy_cjs_import_stmts.items.len,
                         },
                     ) catch unreachable;
 
                     const namespace_ref = p.declareSymbol(.hoisted, arg.loc, cjs_import_name) catch unreachable;
 
-                    p.cjs_import_stmts.append(
+                    p.legacy_cjs_import_stmts.append(
                         p.s(
                             S.Import{
                                 .namespace_ref = namespace_ref,
@@ -5337,9 +5582,13 @@ fn NewParser_(
                     "Multiple exports with the same name \"{s}\"",
                     .{std.mem.trim(u8, alias, "\"'")},
                 );
-            } else {
+            } else if (!p.isDeoptimizedCommonJS()) {
                 try p.named_exports.put(alias, js_ast.NamedExport{ .alias_loc = loc, .ref = ref });
             }
+        }
+
+        fn isDeoptimizedCommonJS(p: *P) bool {
+            return p.commonjs_named_exports_deoptimized and p.commonjs_named_exports.count() > 0;
         }
 
         pub fn recordUsage(p: *P, ref: Ref) void {
@@ -5398,6 +5647,8 @@ fn NewParser_(
 
             if (p.options.features.inlining) {
                 if (p.const_values.get(ref)) |replacement| {
+                    // TODO:
+                    // p.ignoreUsage(ref);
                     return replacement;
                 }
             }
@@ -6051,8 +6302,9 @@ fn NewParser_(
             }
 
             if (p.lexer.jsx_pragma.jsxImportSource()) |import_source| {
-                p.options.jsx.import_source = try p.allocator.dupe(u8, import_source.text);
-                p.options.jsx.classic_import_source = options.JSX.Pragma.parsePackageName(p.options.jsx.import_source);
+                p.options.jsx.classic_import_source = options.JSX.Pragma.parsePackageName(import_source.text);
+                p.options.jsx.package_name = p.options.jsx.classic_import_source;
+                p.options.jsx.setImportSource(p.allocator);
             }
 
             if (p.lexer.jsx_pragma.jsxRuntime()) |runtime| {
@@ -6077,10 +6329,6 @@ fn NewParser_(
             p.hoistSymbols(p.module_scope);
 
             var generated_symbols_count: u32 = 3;
-
-            if (p.options.enable_legacy_bundling) {
-                generated_symbols_count += 4;
-            }
 
             if (p.options.features.hot_module_reloading) {
                 generated_symbols_count += 3;
@@ -6115,14 +6363,6 @@ fn NewParser_(
                 p.jest.afterEach = try p.declareCommonJSSymbol(.unbound, "afterEach");
                 p.jest.beforeAll = try p.declareCommonJSSymbol(.unbound, "beforeAll");
                 p.jest.afterAll = try p.declareCommonJSSymbol(.unbound, "afterAll");
-            }
-
-            if (p.options.enable_legacy_bundling) {
-                p.runtime_imports.@"$$m" = try p.declareGeneratedSymbol(.other, "$$m");
-                p.runtime_imports.@"$$lzy" = try p.declareGeneratedSymbol(.other, "$$lzy");
-                p.runtime_imports.__export = try p.declareGeneratedSymbol(.other, "__export");
-                p.runtime_imports.__exportValue = try p.declareGeneratedSymbol(.other, "__exportValue");
-                p.runtime_imports.__exportDefault = try p.declareGeneratedSymbol(.other, "__exportDefault");
             }
 
             if (p.options.features.hot_module_reloading) {
@@ -6177,9 +6417,7 @@ fn NewParser_(
                             p.jsx_classic = p.declareGeneratedSymbol(.other, "ClassicImportSource") catch unreachable;
                         }
 
-                        if (p.options.jsx.import_source.len > 0) {
-                            p.jsx_automatic = p.declareGeneratedSymbol(.other, "ImportSource") catch unreachable;
-                        }
+                        p.jsx_automatic = p.declareGeneratedSymbol(.other, "ImportSource") catch unreachable;
                     }
                 },
 
@@ -8754,14 +8992,10 @@ fn NewParser_(
                     const test_ = try p.parseExpr(.lowest);
                     try p.lexer.expect(.t_close_paren);
 
-                    const body_loc = p.lexer.loc();
-                    _ = try p.pushScopeForParsePass(.block, body_loc);
-                    defer p.popScope();
-
                     var stmtOpts = ParseStatementOptions{};
                     const body = try p.parseStmt(&stmtOpts);
 
-                    return p.s(S.With{ .body = body, .body_loc = body_loc, .value = test_ }, loc);
+                    return p.s(S.With{ .body = body, .value = test_ }, loc);
                 },
                 .t_switch => {
                     try p.lexer.next();
@@ -11373,11 +11607,15 @@ fn NewParser_(
         }
 
         pub fn addImportRecordByRange(p: *P, kind: ImportKind, range: logger.Range, name: string) u32 {
+            return p.addImportRecordByRangeAndPath(kind, range, fs.Path.init(name));
+        }
+
+        pub fn addImportRecordByRangeAndPath(p: *P, kind: ImportKind, range: logger.Range, path: fs.Path) u32 {
             var index = p.import_records.items.len;
             const record = ImportRecord{
                 .kind = kind,
                 .range = range,
-                .path = fs.Path.init(name),
+                .path = path,
             };
             p.import_records.append(record) catch unreachable;
             return @intCast(u32, index);
@@ -14103,6 +14341,8 @@ fn NewParser_(
             p.scopes_for_current_part.clearRetainingCapacity();
             p.import_records_for_current_part.clearRetainingCapacity();
 
+            p.had_commonjs_named_exports_this_visit = false;
+
             const allocator = p.allocator;
             var opts = PrependTempRefsOpts{};
             var partStmts = ListManaged(Stmt).fromOwnedSlice(allocator, stmts);
@@ -14210,8 +14450,10 @@ fn NewParser_(
                     ),
                     .scopes = try p.scopes_for_current_part.toOwnedSlice(p.allocator),
                     .can_be_removed_if_unused = p.stmtsCanBeRemovedIfUnused(_stmts),
+                    .tag = if (p.had_commonjs_named_exports_this_visit) js_ast.Part.Tag.commonjs_named_export else .none,
                 });
                 p.symbol_uses = .{};
+                p.had_commonjs_named_exports_this_visit = false;
             } else if (p.declared_symbols.len() > 0 or p.symbol_uses.count() > 0) {
 
                 // if the part is dead, invalidate all the usage counts
@@ -14558,14 +14800,36 @@ fn NewParser_(
                     e_.must_keep_due_to_with_stmt = result.is_inside_with_scope;
                     e_.ref = result.ref;
 
-                    // TODO: fix the underyling cause here
-                    // The problem seems to be that result.ref.innerIndex() is not always set.
-
                     // Handle assigning to a constant
-                    // if (in.assign_target != .none and p.symbols.items[result.ref.innerIndex()].kind == .cconst) {
-                    //     const r = js_lexer.rangeOfIdentifier(p.source, expr.loc);
-                    //     p.log.addRangeErrorFmt(p.source, r, p.allocator, "Cannot assign to {s} because it is a constant", .{name}) catch unreachable;
-                    // }
+                    if (in.assign_target != .none and p.symbols.items[result.ref.innerIndex()].kind == .cconst) {
+                        const r = js_lexer.rangeOfIdentifier(p.source, expr.loc);
+                        var notes = p.allocator.alloc(logger.Data, 1) catch unreachable;
+                        notes[0] = logger.Data{
+                            .text = std.fmt.allocPrint(p.allocator, "The symbol \"{s}\" was declared a constant here:", .{name}) catch unreachable,
+                            .location = logger.Location.init_or_nil(p.source, js_lexer.rangeOfIdentifier(p.source, result.declare_loc.?)),
+                        };
+
+                        const is_error = p.const_values.contains(result.ref) or p.options.bundle;
+                        switch (is_error) {
+                            true => p.log.addRangeErrorFmtWithNotes(
+                                p.source,
+                                r,
+                                p.allocator,
+                                notes,
+                                "Cannot assign to \"{s}\" because it is a constant",
+                                .{name},
+                            ) catch unreachable,
+
+                            false => p.log.addRangeErrorFmtWithNotes(
+                                p.source,
+                                r,
+                                p.allocator,
+                                notes,
+                                "This assignment will throw because \"{s}\" is a constant",
+                                .{name},
+                            ) catch unreachable,
+                        }
+                    }
 
                     var original_name: ?string = null;
 
@@ -15005,6 +15269,13 @@ fn NewParser_(
 
                     for (e_.parts) |*part| {
                         part.value = p.visitExpr(part.value);
+                    }
+
+                    // When mangling, inline string values into the template literal. Note that
+                    // it may no longer be a template literal after this point (it may turn into
+                    // a plain string literal instead).
+                    if (p.should_fold_typescript_constant_expressions or p.options.features.inlining) {
+                        return e_.fold(p.allocator, expr.loc);
                     }
                 },
 
@@ -16024,7 +16295,22 @@ fn NewParser_(
                                 return p.newExpr(E.Null{}, expr.loc);
                             }
 
+                            if (p.options.warn_about_unbundled_modules) {
+                                const r = js_lexer.rangeOfIdentifier(p.source, e_.target.loc);
+                                p.log.addRangeDebug(p.source, r, "This call to \"require\" will not be bundled because it has dynamic arguments") catch unreachable;
+                            }
+
                             p.ignoreUsage(p.require_ref);
+
+                            if (!could_be_require_resolve) {
+                                return p.newExpr(
+                                    E.Call{
+                                        .target = p.valueForRequire(e_.target.loc),
+                                        .args = e_.args,
+                                    },
+                                    expr.loc,
+                                );
+                            }
                         }
 
                         if (p.options.warn_about_unbundled_modules) {
@@ -16129,6 +16415,10 @@ fn NewParser_(
 
                     for (e_.args.slice()) |*arg| {
                         arg.* = p.visitExpr(arg.*);
+                    }
+
+                    if (p.options.features.minify_syntax) {
+                        KnownGlobal.maybeMarkConstructorAsPure(e_, p.symbols.items);
                     }
                 },
                 .e_arrow => |e_| {
@@ -16987,22 +17277,22 @@ fn NewParser_(
 
                             // rewrite `module.exports` to `exports`
                             return p.newExpr(E.Identifier{ .ref = p.exports_ref }, name_loc);
-                        } else if (strings.eqlComptime(name, "id") and identifier_opts.assign_target == .none) {
+                        } else if (p.options.bundle and strings.eqlComptime(name, "id") and identifier_opts.assign_target == .none) {
                             // inline module.id
                             p.ignoreUsage(p.module_ref);
                             return p.newExpr(E.String.init(p.source.path.text), name_loc);
-                        } else if (strings.eqlComptime(name, "filename") and identifier_opts.assign_target == .none) {
+                        } else if (p.options.bundle and strings.eqlComptime(name, "filename") and identifier_opts.assign_target == .none) {
                             // inline module.filename
                             p.ignoreUsage(p.module_ref);
                             return p.newExpr(E.String.init(p.source.path.name.filename), name_loc);
-                        } else if (strings.eqlComptime(name, "path") and identifier_opts.assign_target == .none) {
+                        } else if (p.options.bundle and strings.eqlComptime(name, "path") and identifier_opts.assign_target == .none) {
                             // inline module.path
                             p.ignoreUsage(p.module_ref);
                             return p.newExpr(E.String.init(p.source.path.pretty), name_loc);
                         }
                     }
 
-                    if (comptime FeatureFlags.commonjs_to_esm) {
+                    if (comptime FeatureFlags.unwrap_commonjs_to_esm) {
                         if (!p.is_control_flow_dead and id.ref.eql(p.exports_ref) and !p.commonjs_named_exports_deoptimized) {
                             if (identifier_opts.is_delete_target) {
                                 p.deoptimizeCommonJSNamedExports();
@@ -17049,38 +17339,38 @@ fn NewParser_(
                     }
                 },
                 .e_string => |str| {
-                    // minify "long-string".length to 11
-                    if (strings.eqlComptime(name, "length")) {
-                        // don't handle UTF-16 strings for now
-                        if (str.is_utf16)
-                            return null;
-
-                        return p.newExpr(E.Number{ .value = @intToFloat(f64, str.len()) }, loc);
+                    if (p.options.features.minify_syntax) {
+                        // minify "long-string".length to 11
+                        if (strings.eqlComptime(name, "length")) {
+                            return p.newExpr(E.Number{ .value = @intToFloat(f64, str.javascriptLength()) }, loc);
+                        }
                     }
                 },
                 .e_object => |obj| {
                     if (comptime FeatureFlags.inline_properties_in_transpiler) {
-                        //
-                        // Rewrite a property access like this:
-                        //   { f: () => {} }.f
-                        // To:
-                        //   () => {}
-                        //
-                        // To avoid thinking too much about edgecases, only do this for:
-                        //   1) Objects with a single property
-                        //   2) Not a method, not a computed property
-                        if (obj.properties.len == 1 and
-                            !identifier_opts.is_delete_target and
-                            identifier_opts.assign_target == .none and !identifier_opts.is_call_target)
-                        {
-                            const prop: G.Property = obj.properties.ptr[0];
-                            if (prop.value != null and
-                                prop.flags.count() == 0 and
-                                prop.key != null and
-                                prop.key.?.data == .e_string and
-                                prop.key.?.data.e_string.eql([]const u8, name))
+                        if (p.options.features.minify_syntax) {
+                            //
+                            // Rewrite a property access like this:
+                            //   { f: () => {} }.f
+                            // To:
+                            //   () => {}
+                            //
+                            // To avoid thinking too much about edgecases, only do this for:
+                            //   1) Objects with a single property
+                            //   2) Not a method, not a computed property
+                            if (obj.properties.len == 1 and
+                                !identifier_opts.is_delete_target and
+                                identifier_opts.assign_target == .none and !identifier_opts.is_call_target)
                             {
-                                return prop.value.?;
+                                const prop: G.Property = obj.properties.ptr[0];
+                                if (prop.value != null and
+                                    prop.flags.count() == 0 and
+                                    prop.key != null and
+                                    prop.key.?.data == .e_string and
+                                    prop.key.?.data.e_string.eql([]const u8, name))
+                                {
+                                    return prop.value.?;
+                                }
                             }
                         }
                     }
@@ -17363,15 +17653,6 @@ fn NewParser_(
                                 }
                             }
 
-                            // When bundling, replace ExportDefault with __exportDefault(exportsRef, expr);
-                            if (p.options.enable_legacy_bundling) {
-                                var export_default_args = p.allocator.alloc(Expr, 2) catch unreachable;
-                                export_default_args[0] = p.@"module.exports"(expr.loc);
-                                export_default_args[1] = data.value.expr;
-                                stmts.append(p.s(S.SExpr{ .value = p.callRuntime(expr.loc, "__exportDefault", export_default_args) }, expr.loc)) catch unreachable;
-                                return;
-                            }
-
                             if (data.default_name.ref.?.isSourceContentsSlice()) {
                                 data.default_name = createDefaultName(p, data.value.expr.loc) catch unreachable;
                             }
@@ -17381,7 +17662,6 @@ fn NewParser_(
                             switch (s2.data) {
                                 .s_function => |func| {
                                     var name: string = "";
-                                    const had_name = func.func.name != null;
                                     if (func.func.name) |func_loc| {
                                         name = p.loadNameFromRef(func_loc.ref.?);
                                     } else {
@@ -17403,30 +17683,6 @@ fn NewParser_(
                                             _ = p.injectReplacementExport(stmts, Ref.None, logger.Loc.Empty, entry);
                                             return;
                                         }
-
-                                        // When bundling, replace ExportDefault with __exportDefault(exportsRef, expr);
-                                        if (p.options.enable_legacy_bundling) {
-                                            var export_default_args = p.allocator.alloc(Expr, 2) catch unreachable;
-                                            export_default_args[0] = p.@"module.exports"(data.value.expr.loc);
-                                            export_default_args[1] = data.value.expr;
-                                            stmts.append(p.s(S.SExpr{ .value = p.callRuntime(data.value.expr.loc, "__exportDefault", export_default_args) }, data.value.expr.loc)) catch unreachable;
-                                            return;
-                                        }
-                                    } else if (p.options.enable_legacy_bundling) {
-                                        var export_default_args = p.allocator.alloc(Expr, 2) catch unreachable;
-                                        export_default_args[0] = p.@"module.exports"(s2.loc);
-
-                                        if (had_name) {
-                                            export_default_args[1] = p.newExpr(E.Identifier{ .ref = func.func.name.?.ref.? }, s2.loc);
-                                            stmts.ensureUnusedCapacity(2) catch unreachable;
-
-                                            stmts.appendAssumeCapacity(s2);
-                                        } else {
-                                            export_default_args[1] = p.newExpr(E.Function{ .func = func.func }, s2.loc);
-                                        }
-
-                                        stmts.append(p.s(S.SExpr{ .value = p.callRuntime(s2.loc, "__exportDefault", export_default_args) }, s2.loc)) catch unreachable;
-                                        return;
                                     }
 
                                     if (data.default_name.ref.?.isSourceContentsSlice()) {
@@ -17455,37 +17711,6 @@ fn NewParser_(
                                             _ = p.injectReplacementExport(stmts, Ref.None, logger.Loc.Empty, entry);
                                             return;
                                         }
-
-                                        // When bundling, replace ExportDefault with __exportDefault(exportsRef, expr);
-                                        if (p.options.enable_legacy_bundling) {
-                                            var export_default_args = p.allocator.alloc(Expr, 2) catch unreachable;
-                                            export_default_args[0] = p.@"module.exports"(data.value.expr.loc);
-                                            export_default_args[1] = data.value.expr;
-                                            stmts.append(p.s(S.SExpr{ .value = p.callRuntime(data.value.expr.loc, "__exportDefault", export_default_args) }, data.value.expr.loc)) catch unreachable;
-                                            return;
-                                        }
-                                    } else if (p.options.enable_legacy_bundling) {
-                                        var export_default_args = p.allocator.alloc(Expr, 2) catch unreachable;
-                                        export_default_args[0] = p.@"module.exports"(s2.loc);
-
-                                        const class_name_ref = brk: {
-                                            if (class.class.class_name) |class_name_ref| {
-                                                if (class_name_ref.ref) |ref| {
-                                                    break :brk ref;
-                                                }
-                                            }
-                                            break :brk null;
-                                        };
-                                        if (class_name_ref) |ref| {
-                                            stmts.ensureUnusedCapacity(2) catch unreachable;
-                                            stmts.appendAssumeCapacity(s2);
-                                            export_default_args[1] = p.newExpr(E.Identifier{ .ref = ref }, s2.loc);
-                                        } else {
-                                            export_default_args[1] = p.newExpr(class.class, s2.loc);
-                                        }
-
-                                        stmts.append(p.s(S.SExpr{ .value = p.callRuntime(s2.loc, "__exportDefault", export_default_args) }, s2.loc)) catch unreachable;
-                                        return;
                                     }
 
                                     if (data.default_name.ref.?.isSourceContentsSlice()) {
@@ -17501,14 +17726,6 @@ fn NewParser_(
                     }
                 },
                 .s_export_equals => |data| {
-                    if (p.options.enable_legacy_bundling) {
-                        var export_default_args = p.allocator.alloc(Expr, 2) catch unreachable;
-                        export_default_args[0] = p.@"module.exports"(stmt.loc);
-                        export_default_args[1] = data.value;
-
-                        stmts.append(p.s(S.SExpr{ .value = p.callRuntime(stmt.loc, "__exportDefault", export_default_args) }, stmt.loc)) catch unreachable;
-                        return;
-                    }
 
                     // "module.exports = value"
                     stmts.append(
@@ -17615,7 +17832,7 @@ fn NewParser_(
                 .s_expr => |data| {
                     p.stmt_expr_value = data.value.data;
                     const is_top_level = p.current_scope == p.module_scope;
-                    if (comptime FeatureFlags.commonjs_to_esm) {
+                    if (comptime FeatureFlags.unwrap_commonjs_to_esm) {
                         p.commonjs_named_exports_needs_conversion = if (is_top_level)
                             std.math.maxInt(u32)
                         else
@@ -17627,7 +17844,7 @@ fn NewParser_(
                     // simplify unused
                     data.value = SideEffects.simpifyUnusedExpr(p, data.value) orelse data.value.toEmpty();
 
-                    if (comptime FeatureFlags.commonjs_to_esm) {
+                    if (comptime FeatureFlags.unwrap_commonjs_to_esm) {
                         if (is_top_level) {
                             if (data.value.data == .e_binary) {
                                 const to_convert = p.commonjs_named_exports_needs_conversion;
@@ -17647,9 +17864,9 @@ fn NewParser_(
                                                 .value = bin.right,
                                             };
                                             p.recordDeclaredSymbol(ref) catch unreachable;
-                                            p.ignoreUsage(ref);
                                             p.esm_export_keyword.loc = stmt.loc;
                                             p.esm_export_keyword.len = 5;
+                                            p.had_commonjs_named_exports_this_visit = true;
                                             var clause_items = p.allocator.alloc(js_ast.ClauseItem, 1) catch unreachable;
                                             clause_items[0] = js_ast.ClauseItem{
                                                 // We want the generated name to not conflict
@@ -17666,6 +17883,7 @@ fn NewParser_(
                                                         S.Local{
                                                             .kind = .k_var,
                                                             .is_export = false,
+                                                            .was_commonjs_export = true,
                                                             .decls = decls,
                                                         },
                                                         stmt.loc,
@@ -18270,23 +18488,22 @@ fn NewParser_(
         }
 
         fn visitDecls(p: *P, decls: []G.Decl, was_const: bool, comptime is_possibly_decl_to_remove: bool) usize {
-            var i: usize = 0;
-            const count = decls.len;
             var j: usize = 0;
             var out_decls = decls;
-            while (i < count) : (i += 1) {
-                p.visitBinding(decls[i].binding, null);
+            for (decls) |*decl| {
+                p.visitBinding(decl.binding, null);
 
-                if (decls[i].value != null) {
-                    var val = decls[i].value.?;
+                if (decl.value != null) {
+                    var val = decl.value.?;
                     const was_anonymous_named_expr = val.isAnonymousNamed();
                     var replacement: ?*const RuntimeFeatures.ReplaceableExport = null;
 
+                    const prev_require_to_convert_count = p.imports_to_convert_from_require.items.len;
                     const prev_macro_call_count = p.macro_call_count;
                     const orig_dead = p.is_control_flow_dead;
                     if (comptime is_possibly_decl_to_remove) {
-                        if (decls[i].binding.data == .b_identifier) {
-                            if (p.options.features.replace_exports.getPtr(p.loadNameFromRef(decls[i].binding.data.b_identifier.ref))) |replacer| {
+                        if (decl.binding.data == .b_identifier) {
+                            if (p.options.features.replace_exports.getPtr(p.loadNameFromRef(decl.binding.data.b_identifier.ref))) |replacer| {
                                 replacement = replacer;
                                 if (replacer.* != .replace) {
                                     p.is_control_flow_dead = true;
@@ -18295,15 +18512,35 @@ fn NewParser_(
                         }
                     }
 
-                    decls[i].value = p.visitExpr(val);
+                    decl.value = p.visitExpr(val);
+
+                    if (comptime FeatureFlags.unwrap_commonjs_to_esm) {
+                        if (prev_require_to_convert_count < p.imports_to_convert_from_require.items.len) {
+                            if (decl.binding.data == .b_identifier) {
+                                const ref = decl.binding.data.b_identifier.ref;
+                                if (decl.value != null and
+                                    decl.value.?.data == .e_require_string and
+                                    decl.value.?.data.e_require_string.unwrapped_id != std.math.maxInt(u32))
+                                {
+                                    p.imports_to_convert_from_require.items[decl.value.?.data.e_require_string.unwrapped_id].namespace.ref = ref;
+                                    p.import_items_for_namespace.put(
+                                        p.allocator,
+                                        ref,
+                                        ImportItemForNamespaceMap.init(p.allocator),
+                                    ) catch unreachable;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
 
                     if (comptime is_possibly_decl_to_remove) {
                         p.is_control_flow_dead = orig_dead;
                     }
                     if (comptime is_possibly_decl_to_remove) {
-                        if (decls[i].binding.data == .b_identifier) {
+                        if (decl.binding.data == .b_identifier) {
                             if (replacement) |ptr| {
-                                if (!p.replaceDeclAndPossiblyRemove(&decls[i], ptr)) {
+                                if (!p.replaceDeclAndPossiblyRemove(decl, ptr)) {
                                     continue;
                                 }
                             }
@@ -18311,7 +18548,7 @@ fn NewParser_(
                     }
 
                     p.visitDecl(
-                        &decls[i],
+                        decl,
                         was_anonymous_named_expr,
                         was_const and !p.current_scope.is_after_const_local_prefix,
                         if (comptime allow_macros)
@@ -18320,11 +18557,11 @@ fn NewParser_(
                             false,
                     );
                 } else if (comptime is_possibly_decl_to_remove) {
-                    if (decls[i].binding.data == .b_identifier) {
-                        if (p.options.features.replace_exports.getPtr(p.loadNameFromRef(decls[i].binding.data.b_identifier.ref))) |ptr| {
-                            if (!p.replaceDeclAndPossiblyRemove(&decls[i], ptr)) {
+                    if (decl.binding.data == .b_identifier) {
+                        if (p.options.features.replace_exports.getPtr(p.loadNameFromRef(decl.binding.data.b_identifier.ref))) |ptr| {
+                            if (!p.replaceDeclAndPossiblyRemove(decl, ptr)) {
                                 p.visitDecl(
-                                    &decls[i],
+                                    decl,
                                     was_const and !p.current_scope.is_after_const_local_prefix,
                                     false,
                                     false,
@@ -18336,17 +18573,11 @@ fn NewParser_(
                     }
                 }
 
-                if (comptime is_possibly_decl_to_remove) {
-                    out_decls[j] = decls[i];
-                    j += 1;
-                }
+                out_decls[j] = decl.*;
+                j += 1;
             }
 
-            if (comptime is_possibly_decl_to_remove) {
-                return j;
-            }
-
-            return decls.len;
+            return j;
         }
 
         fn injectReplacementExport(p: *P, stmts: *StmtList, name_ref: Ref, loc: logger.Loc, replacement: *const RuntimeFeatures.ReplaceableExport) bool {
@@ -18476,9 +18707,9 @@ fn NewParser_(
             switch (decl.binding.data) {
                 .b_identifier => |id| {
                     if (could_be_const_value or (allow_macros and could_be_macro)) {
-                        if (decl.value != null) {
-                            if (decl.value.?.canBeConstValue()) {
-                                p.const_values.put(p.allocator, id.ref, decl.value.?) catch unreachable;
+                        if (decl.value) |val| {
+                            if (val.canBeConstValue()) {
+                                p.const_values.put(p.allocator, id.ref, val) catch unreachable;
                             }
                         }
                     } else {
@@ -18766,7 +18997,8 @@ fn NewParser_(
                                 .e_identifier => |k| p.newExpr(E.Identifier{ .ref = k.ref }, loc),
                                 .e_number => |k| p.newExpr(E.Number{ .value = k.value }, loc),
                                 .e_string => |k| p.newExpr(E.String{ .data = k.data }, loc),
-                                else => undefined,
+                                .e_index => |k| p.newExpr(E.Index{ .target = k.target, .index = k.index }, loc),
+                                else => unreachable,
                             };
 
                             const descriptor_kind: f64 = if (!prop.flags.contains(.is_method)) 2 else 1;
@@ -18807,7 +19039,7 @@ fn NewParser_(
                                 target = p.newExpr(E.This{}, prop.key.?.loc);
                             }
 
-                            if (prop.flags.contains(.is_computed)) {
+                            if (prop.flags.contains(.is_computed) or prop.key.?.data == .e_number) {
                                 target = p.newExpr(E.Index{
                                     .target = target,
                                     .index = prop.key.?,
@@ -19538,11 +19770,16 @@ fn NewParser_(
                                 break :list_getter &after;
                             },
                             .s_function => |data| {
-                                // Manually hoist block-level function declarations to preserve semantics.
-                                // This is only done for function declarations that are not generators
-                                // or async functions, since this is a backwards-compatibility hack from
-                                // Annex B of the JavaScript standard.
-                                if (!p.current_scope.kindStopsHoisting() and p.symbols.items[data.func.name.?.ref.?.innerIndex()].kind == .hoisted_function) {
+                                if (
+                                // Hoist module-level functions when
+                                ((FeatureFlags.unwrap_commonjs_to_esm and p.current_scope == p.module_scope and !data.func.flags.contains(.is_export)) or
+
+                                    // Manually hoist block-level function declarations to preserve semantics.
+                                    // This is only done for function declarations that are not generators
+                                    // or async functions, since this is a backwards-compatibility hack from
+                                    // Annex B of the JavaScript standard.
+                                    !p.current_scope.kindStopsHoisting()) and p.symbols.items[data.func.name.?.ref.?.innerIndex()].kind == .hoisted_function)
+                                {
                                     break :list_getter &before;
                                 }
                             },
@@ -19685,22 +19922,22 @@ fn NewParser_(
                     try stmts.resize(total_size);
                 }
 
-                var i: usize = 0;
+                var remain = stmts.items;
 
                 for (before.items) |item| {
-                    stmts.items[i] = item;
-                    i += 1;
+                    remain[0] = item;
+                    remain = remain[1..];
                 }
 
                 const visited_slice = visited.items[0..visited_count];
                 for (visited_slice) |item| {
-                    stmts.items[i] = item;
-                    i += 1;
+                    remain[0] = item;
+                    remain = remain[1..];
                 }
 
                 for (after.items) |item| {
-                    stmts.items[i] = item;
-                    i += 1;
+                    remain[0] = item;
+                    remain = remain[1..];
                 }
             }
 
@@ -19725,7 +19962,7 @@ fn NewParser_(
                         switch (stmt.data) {
                             .s_empty, .s_comment, .s_directive, .s_debugger, .s_type_script => continue,
                             .s_local => |local| {
-                                if (!local.is_export and local.kind == .k_const) {
+                                if (!local.is_export and local.kind == .k_const and !local.was_commonjs_export) {
                                     var decls: []Decl = local.decls;
                                     var end: usize = 0;
                                     for (decls) |decl| {
@@ -20792,6 +21029,9 @@ fn NewParser_(
                 // .top_Level_await_keyword = p.top_level_await_keyword,
                 .bun_plugin = p.bun_plugin,
                 .commonjs_named_exports = p.commonjs_named_exports,
+
+                // TODO:
+                // .const_values = p.const_values,
             };
         }
 
@@ -20817,7 +21057,7 @@ fn NewParser_(
 
             scope_order.appendAssumeCapacity(ScopeOrder{ .loc = locModuleScope, .scope = scope });
             this.* = P{
-                .cjs_import_stmts = @TypeOf(this.cjs_import_stmts).init(allocator),
+                .legacy_cjs_import_stmts = @TypeOf(this.legacy_cjs_import_stmts).init(allocator),
                 // This must default to true or else parsing "in" won't work right.
                 // It will fail for the case in the "in-keyword.js" file
                 .allow_in = true,
@@ -20850,6 +21090,11 @@ fn NewParser_(
 
                 // Only enable during bundling
                 .commonjs_named_exports_deoptimized = !opts.bundle,
+                .unwrap_all_requires = opts.bundle and
+                    if (source.path.packageName()) |pkg|
+                    opts.features.shouldUnwrapRequire(pkg)
+                else
+                    false,
             };
 
             this.symbols = std.ArrayList(Symbol).init(allocator);

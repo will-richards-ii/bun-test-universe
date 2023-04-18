@@ -1,8 +1,10 @@
 # `bun build` tests using `expectBundled`
 
-Most bundler tests were ported [from esbuild][1], located in `test/bundler/esbuild`. Our own tests are in `bundler_*.test.ts`
+Most bundler tests were ported [from esbuild][1], located in `test/bundler/esbuild`. Our own tests are in `bundler_*.test.ts`. Not all esbuild tests were fully ported, check for `// GENERATED` to see which are missing.
 
 [1]: https://github.com/evanw/esbuild/tree/main/internal/bundler_tests
+
+## expectBundled
 
 Call `expectBundled` within a test to test the bundler. The `id` passed as the first argument must be unique across the all tests, and generally uses the format `file/TestName`. The second parameter is an options object.
 
@@ -188,3 +190,23 @@ Places that are not required to be dce'd contain `POSSIBLE_REMOVAL` and do not t
 ## keepNames tricks
 
 In `esbuild/default.test.ts`, test `default/KeepNamesTreeShaking`, we call the esbuild cli to minify identifiers, and then check the code for expected class names to survive the minification (keep names forcibily sets functions `.name`).
+
+# capture
+
+This lets you capture the exact js that is emitted by wrapping it in a function call `capture`. Like a partial snapshot.
+
+```ts
+itBundled("minify/TemplateStringFolding", {
+  files: {
+    "/entry.js": /* js */ `
+      capture(\`😋📋👌\`.length)
+      capture(\`😋📋👌\`.length === 6)
+      capture(\`😋📋👌\`.length == 6)
+      capture(\`😋📋👌\`.length === 2)
+      capture(\`😋📋👌\`.length == 2)
+    `,
+  },
+  minifySyntax: true,
+  capture: ["6", "true", "true", "false", "false"],
+});
+```

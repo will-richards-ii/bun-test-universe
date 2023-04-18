@@ -53,6 +53,11 @@ pub const BuildCommand = struct {
         this_bundler.resolver.opts.react_server_components = ctx.bundler_options.react_server_components;
         this_bundler.options.code_splitting = ctx.bundler_options.code_splitting;
         this_bundler.resolver.opts.code_splitting = ctx.bundler_options.code_splitting;
+        this_bundler.options.minify_syntax = ctx.bundler_options.minify_syntax;
+        this_bundler.resolver.opts.minify_whitespace = ctx.bundler_options.minify_whitespace;
+
+        this_bundler.options.minify_whitespace = ctx.bundler_options.minify_whitespace;
+        this_bundler.resolver.opts.minify_whitespace = ctx.bundler_options.minify_whitespace;
 
         this_bundler.configureLinker();
 
@@ -101,8 +106,17 @@ pub const BuildCommand = struct {
                     ctx.log,
                     ctx.args,
                 );
-                try log.msgs.appendSlice(result.errors);
-                try log.msgs.appendSlice(result.warnings);
+
+                if (log.msgs.items.len > 0) {
+                    try log.printForLogLevel(Output.errorWriter());
+
+                    if (result.errors.len > 0 or result.output_files.len == 0) {
+                        Output.flush();
+                        exitOrWatch(1, ctx.debug.hot_reload == .watch);
+                        unreachable;
+                    }
+                }
+
                 break :brk result.output_files;
             }
 
@@ -131,7 +145,7 @@ pub const BuildCommand = struct {
             {
                 dump: {
                     defer Output.flush();
-                    var writer = Output.errorWriter();
+                    var writer = Output.writer();
                     var output_dir = this_bundler.options.output_dir;
                     if (ctx.bundler_options.outfile.len > 0 and output_files.len == 1 and output_files[0].value == .buffer) {
                         output_dir = std.fs.path.dirname(ctx.bundler_options.outfile) orelse ".";

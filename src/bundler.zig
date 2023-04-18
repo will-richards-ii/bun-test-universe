@@ -565,9 +565,7 @@ pub const Bundler = struct {
 
         try this.runEnvLoader();
 
-        if (this.env.isProduction()) {
-            this.options.jsx.setProduction(this.allocator, true);
-        }
+        this.options.jsx.setProduction(this.env.isProduction());
 
         js_ast.Expr.Data.Store.create(this.allocator);
         js_ast.Stmt.Data.Store.create(this.allocator);
@@ -1382,10 +1380,10 @@ pub const Bundler = struct {
 
                 var opts = js_parser.Parser.Options.init(jsx, loader);
                 opts.enable_legacy_bundling = false;
-                opts.transform_require_to_import = bundler.options.allow_runtime and !bundler.options.platform.isBun();
+                opts.legacy_transform_require_to_import = bundler.options.allow_runtime and !bundler.options.platform.isBun();
                 opts.features.allow_runtime = bundler.options.allow_runtime;
                 opts.features.trim_unused_imports = bundler.options.trim_unused_imports orelse loader.isTypeScript();
-                opts.features.should_fold_typescript_constant_expressions = loader.isTypeScript() or platform.isBun();
+                opts.features.should_fold_typescript_constant_expressions = loader.isTypeScript() or platform.isBun() or bundler.options.inlining;
                 opts.features.dynamic_require = platform.isBun();
 
                 // @bun annotation
@@ -1417,6 +1415,8 @@ pub const Bundler = struct {
                 opts.features.jsx_optimization_hoist = bundler.options.jsx_optimization_hoist orelse opts.features.jsx_optimization_inline;
                 opts.features.hoist_bun_plugin = this_parse.hoist_bun_plugin;
                 opts.features.inject_jest_globals = this_parse.inject_jest_globals;
+                opts.features.minify_syntax = bundler.options.minify_syntax;
+
                 if (bundler.macro_context == null) {
                     bundler.macro_context = js_ast.Macro.MacroContext.init(bundler);
                 }

@@ -598,54 +598,42 @@ pub const Platform = enum {
         break :brk array;
     };
 
-    pub const default_conditions_strings = .{
-        .browser = @as(string, "browser"),
-        .import = @as(string, "import"),
-        .worker = @as(string, "worker"),
-        .require = @as(string, "require"),
-        .node = @as(string, "node"),
-        .default = @as(string, "default"),
-        .bun = @as(string, "bun"),
-        .bun_macro = @as(string, "bun_macro"),
-        .module = @as(string, "module"), // used in tslib
-        .development = @as(string, "development"),
-        .production = @as(string, "production"),
-    };
-
     pub const DefaultConditions: std.EnumArray(Platform, []const string) = brk: {
         var array = std.EnumArray(Platform, []const string).initUndefined();
 
         array.set(Platform.node, &[_]string{
-            default_conditions_strings.node,
-            default_conditions_strings.module,
+            "node",
+            "module",
         });
 
         var listc = [_]string{
-            default_conditions_strings.browser,
-            default_conditions_strings.module,
+            "browser",
+            "module",
         };
         array.set(Platform.browser, &listc);
         array.set(
             Platform.bun,
             &[_]string{
-                default_conditions_strings.bun,
-                default_conditions_strings.worker,
-                default_conditions_strings.module,
-                default_conditions_strings.node,
-                default_conditions_strings.browser,
+                "bun",
+                "worker",
+                "module",
+                "node",
+                "default",
+                "browser",
             },
         );
         array.set(
             Platform.bun_macro,
             &[_]string{
-                default_conditions_strings.bun,
-                default_conditions_strings.worker,
-                default_conditions_strings.module,
-                default_conditions_strings.node,
-                default_conditions_strings.browser,
+                "bun",
+                "worker",
+                "module",
+                "node",
+                "default",
+                "browser",
             },
         );
-        // array.set(Platform.bun_macro, [_]string{ default_conditions_strings.bun_macro, default_conditions_strings.browser, default_conditions_strings.default, },);
+        // array.set(Platform.bun_macro, [_]string{ "bun_macro", "browser", "default", },);
 
         // Original comment:
         // The neutral platform is for people that don't want esbuild to try to
@@ -868,15 +856,16 @@ pub const ESMConditions = struct {
         try import_condition_map.ensureTotalCapacity(defaults.len + 1);
         try require_condition_map.ensureTotalCapacity(defaults.len + 1);
 
-        import_condition_map.putAssumeCapacityNoClobber(Platform.default_conditions_strings.import, {});
-        require_condition_map.putAssumeCapacityNoClobber(Platform.default_conditions_strings.require, {});
-        default_condition_amp.putAssumeCapacityNoClobber(Platform.default_conditions_strings.default, {});
+        import_condition_map.putAssumeCapacity("import", {});
+        require_condition_map.putAssumeCapacity("require", {});
 
         for (defaults) |default| {
             default_condition_amp.putAssumeCapacityNoClobber(default, {});
             import_condition_map.putAssumeCapacityNoClobber(default, {});
             require_condition_map.putAssumeCapacityNoClobber(default, {});
         }
+
+        default_condition_amp.putAssumeCapacity("default", {});
 
         return ESMConditions{
             .default = default_condition_amp,
@@ -901,11 +890,11 @@ pub const JSX = struct {
         factory: []const string = Defaults.Factory,
         fragment: []const string = Defaults.Fragment,
         runtime: JSX.Runtime = JSX.Runtime.automatic,
+        import_source: ImportSource = .{},
 
         /// Facilitates automatic JSX importing
         /// Set on a per file basis like this:
         /// /** @jsxImportSource @emotion/core */
-        import_source: string = "react/jsx-dev-runtime",
         classic_import_source: string = "react",
         package_name: []const u8 = "react",
         // https://github.com/facebook/react/commit/2f26eb85d657a08c21edbac1e00f9626d68f84ae
@@ -913,11 +902,20 @@ pub const JSX = struct {
         supports_fast_refresh: bool = true,
         use_embedded_refresh_runtime: bool = false,
 
-        jsx: string = Defaults.JSXFunctionDev,
-        // jsx_static: string = Defaults.JSXStaticFunction,
-
         development: bool = true,
         parse: bool = true,
+
+        pub const ImportSource = struct {
+            development: string = "react/jsx-dev-runtime",
+            production: string = "react/jsx-runtime",
+        };
+
+        pub fn importSource(this: *const Pragma) string {
+            return switch (this.development) {
+                true => this.import_source.development,
+                false => this.import_source.production,
+            };
+        }
 
         pub fn parsePackageName(str: string) string {
             if (str[0] == '@') {
@@ -941,34 +939,34 @@ pub const JSX = struct {
             return strings.eqlComptime(pragma.package_name, "react") or strings.eqlComptime(pragma.package_name, "@emotion/jsx") or strings.eqlComptime(pragma.package_name, "@emotion/react");
         }
 
-        pub fn setImportSource(pragma: *Pragma, allocator: std.mem.Allocator, suffix: []const u8) void {
+        pub fn setImportSource(pragma: *Pragma, allocator: std.mem.Allocator) void {
             strings.concatIfNeeded(
                 allocator,
-                &pragma.import_source,
+                &pragma.import_source.development,
                 &[_]string{
                     pragma.package_name,
-                    suffix,
+                    "jsx-dev-runtime",
+                },
+                &.{
+                    Defaults.ImportSourceDev,
+                },
+            ) catch unreachable;
+
+            strings.concatIfNeeded(
+                allocator,
+                &pragma.import_source.production,
+                &[_]string{
+                    pragma.package_name,
+                    "jsx-runtime",
                 },
                 &.{
                     Defaults.ImportSource,
-                    Defaults.ImportSourceDev,
                 },
             ) catch unreachable;
         }
 
-        pub fn setProduction(pragma: *Pragma, allocator: std.mem.Allocator, is_production: bool) void {
+        pub fn setProduction(pragma: *Pragma, is_production: bool) void {
             pragma.development = !is_production;
-            const package_name = parsePackageName(pragma.import_source);
-            pragma.package_name = package_name;
-            pragma.classic_import_source = package_name;
-
-            if (is_production) {
-                pragma.setImportSource(allocator, "/jsx-runtime");
-                pragma.jsx = "jsx";
-            } else {
-                pragma.setImportSource(allocator, "/jsx-dev-runtime");
-                pragma.jsx = "jsxDEV";
-            }
         }
 
         pub const Defaults = struct {
@@ -1034,23 +1032,9 @@ pub const JSX = struct {
             pragma.runtime = jsx.runtime;
 
             if (jsx.import_source.len > 0) {
-                pragma.import_source = jsx.import_source;
-                if (jsx.import_source.len > "solid-js".len and strings.eqlComptime(jsx.import_source[0.."solid-js".len], "solid-js")) {
-                    pragma.runtime = .solid;
-                    pragma.supports_fast_refresh = false;
-                }
-                pragma.package_name = parsePackageName(pragma.import_source);
-            } else if (jsx.development) {
-                pragma.import_source = Defaults.ImportSourceDev;
-                pragma.package_name = "react";
-            } else {
-                pragma.import_source = Defaults.ImportSource;
-            }
-
-            if (jsx.development) {
-                pragma.jsx = Defaults.JSXFunctionDev;
-            } else {
-                pragma.jsx = Defaults.JSXFunction;
+                pragma.package_name = parsePackageName(pragma.importSource());
+                pragma.setImportSource(allocator);
+                pragma.classic_import_source = pragma.package_name;
             }
 
             pragma.supports_fast_refresh = if (pragma.runtime == .solid) false else pragma.supports_fast_refresh;
@@ -1345,7 +1329,7 @@ pub const BundleOptions = struct {
     allow_runtime: bool = true,
 
     trim_unused_imports: ?bool = null,
-    mark_bun_builtins_as_external: bool = false,
+    mark_builtins_as_external: bool = false,
     react_server_components: bool = false,
     react_server_components_boundary: string = "",
     hot_module_reloading: bool = false,
@@ -1410,11 +1394,31 @@ pub const BundleOptions = struct {
 
     inlining: bool = false,
     minify_whitespace: bool = false,
+    minify_syntax: bool = false,
+
+    /// This is a list of packages which even when require() is used, we will
+    /// instead convert to ESM import statements.
+    ///
+    /// This is not normally a safe transformation.
+    ///
+    /// So we have a list of packages which we know are safe to do this with.
+    unwrap_commonjs_packages: []const string = &default_unwrap_commonjs_packages,
 
     pub fn setProduction(this: *BundleOptions, value: bool) void {
         this.production = value;
         this.jsx.development = !value;
     }
+
+    pub const default_unwrap_commonjs_packages = [_]string{
+        "__bun-test-unwrap-commonjs__",
+        "react",
+        "react-client",
+        "react-dom",
+        "react-is",
+        "react-refresh",
+        "react-server",
+        "scheduler",
+    };
 
     pub inline fn cssImportBehavior(this: *const BundleOptions) Api.CssInJsBehavior {
         switch (this.platform) {
@@ -1822,6 +1826,8 @@ pub const BundleOptions = struct {
 
         opts.tree_shaking = opts.serve or opts.platform.isBun() or opts.production or is_generating_bundle;
         opts.inlining = opts.tree_shaking;
+        if (opts.inlining)
+            opts.minify_syntax = true;
 
         if (opts.origin.isAbsolute()) {
             opts.import_path_format = ImportPathFormat.absolute_url;

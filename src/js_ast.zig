@@ -1430,6 +1430,49 @@ pub const E = struct {
     pub const Number = struct {
         value: f64,
 
+        const double_digit = [_]string{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "70", "71", "72", "73", "74", "75", "76", "77", "78", "79", "80", "81", "82", "83", "84", "85", "86", "87", "88", "89", "90", "91", "92", "93", "94", "95", "96", "97", "98", "99", "100" };
+        const neg_double_digit = [_]string{ "-0", "-1", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9", "-11", "-12", "-13", "-14", "-15", "-16", "-17", "-18", "-19", "-20", "-21", "-22", "-23", "-24", "-25", "-26", "-27", "-28", "-29", "-30", "-31", "-32", "-33", "-34", "-35", "-36", "-37", "-38", "-39", "-40", "-41", "-42", "-43", "-44", "-45", "-46", "-47", "-48", "-49", "-50", "-51", "-52", "-53", "-54", "-55", "-56", "-57", "-58", "-59", "-60", "-61", "-62", "-63", "-64", "-65", "-66", "-67", "-68", "-69", "-70", "-71", "-72", "-73", "-74", "-75", "-76", "-77", "-78", "-79", "-80", "-81", "-82", "-83", "-84", "-85", "-86", "-87", "-88", "-89", "-90", "-91", "-92", "-93", "-94", "-95", "-96", "-97", "-98", "-99", "-100" };
+
+        /// String concatenation with numbers is required by the TypeScript compiler for
+        /// "constant expression" handling in enums. However, we don't want to introduce
+        /// correctness bugs by accidentally stringifying a number differently than how
+        /// a real JavaScript VM would do it. So we are conservative and we only do this
+        /// when we know it'll be the same result.
+        pub fn toStringSafely(this: Number, allocator: std.mem.Allocator) ?string {
+            return toStringFromF64Safe(this.value, allocator);
+        }
+
+        pub fn toStringFromF64Safe(value: f64, allocator: std.mem.Allocator) ?string {
+            if (value == @trunc(value)) {
+                const int_value = @floatToInt(i64, value);
+                const abs = @intCast(u64, std.math.absInt(int_value) catch return null);
+                if (abs < double_digit.len) {
+                    return if (value < 0)
+                        neg_double_digit[abs]
+                    else
+                        double_digit[abs];
+                }
+
+                if (abs <= std.math.maxInt(i32)) {
+                    return std.fmt.allocPrint(allocator, "{d}", .{@intCast(i32, int_value)}) catch return null;
+                }
+            }
+
+            if (std.math.isNan(value)) {
+                return "NaN";
+            }
+
+            if (std.math.isNegativeInf(value)) {
+                return "-Infinity";
+            }
+
+            if (std.math.isInf(value)) {
+                return "Infinity";
+            }
+
+            return null;
+        }
+
         pub inline fn toU64(self: Number) u64 {
             @setRuntimeSafety(false);
             return @floatToInt(u64, @max(@trunc(self.value), 0));
@@ -1901,6 +1944,19 @@ pub const E = struct {
             };
         }
 
+        pub fn javascriptLength(s: *const String) u32 {
+            if (s.rope_len > 0) {
+                // We only support ascii ropes for now
+                return s.rope_len;
+            }
+
+            if (s.isUTF8()) {
+                return @truncate(u32, bun.simdutf.length.utf16.from.utf8.le(s.data));
+            }
+
+            return @truncate(u32, s.slice16().len);
+        }
+
         pub inline fn len(s: *const String) usize {
             return if (s.rope_len > 0) s.rope_len else s.data.len;
         }
@@ -2022,6 +2078,96 @@ pub const E = struct {
         tag: ?ExprNodeIndex = null,
         head: E.String,
         parts: []TemplatePart = &([_]TemplatePart{}),
+
+        /// "`a${'b'}c`" => "`abc`"
+        pub fn fold(
+            this: *Template,
+            allocator: std.mem.Allocator,
+            loc: logger.Loc,
+        ) Expr {
+            if (this.tag != null) {
+                return Expr{
+                    .data = .{
+                        .e_template = this,
+                    },
+                    .loc = loc,
+                };
+            }
+
+            // we only fold utf-8/ascii for now
+            if (this.parts.len == 0 or !this.head.isUTF8()) {
+                return Expr.init(E.String, this.head, loc);
+            }
+
+            var parts = std.ArrayList(TemplatePart).initCapacity(allocator, this.parts.len) catch unreachable;
+            var head = Expr.init(E.String, this.head, loc);
+            for (this.parts) |part_| {
+                var part = part_;
+
+                switch (part.value.data) {
+                    .e_number => {
+                        if (part.value.data.e_number.toStringSafely(allocator)) |s| {
+                            part.value = Expr.init(E.String, E.String.init(s), part.value.loc);
+                        }
+                    },
+                    .e_null => {
+                        part.value = Expr.init(E.String, E.String.init("null"), part.value.loc);
+                    },
+                    .e_boolean => {
+                        part.value = Expr.init(E.String, E.String.init(if (part.value.data.e_boolean.value)
+                            "true"
+                        else
+                            "false"), part.value.loc);
+                    },
+                    .e_undefined => {
+                        part.value = Expr.init(E.String, E.String.init("undefined"), part.value.loc);
+                    },
+                    else => {},
+                }
+
+                if (part.value.data == .e_string and part.tail.isUTF8() and part.value.data.e_string.isUTF8()) {
+                    if (parts.items.len == 0) {
+                        if (part.value.data.e_string.len() > 0) {
+                            head.data.e_string.push(part.value.data.e_string);
+                        }
+
+                        if (part.tail.len() > 0) {
+                            head.data.e_string.push(Expr.init(E.String, part.tail, part.tail_loc).data.e_string);
+                        }
+
+                        continue;
+                    } else {
+                        var prev_part = &parts.items[parts.items.len - 1];
+
+                        if (part.value.data.e_string.len() > 0) {
+                            prev_part.tail.push(part.value.data.e_string);
+                        }
+
+                        if (part.tail.len() > 0) {
+                            prev_part.tail.push(Expr.init(E.String, part.tail, part.tail_loc).data.e_string);
+                        }
+                    }
+                } else {
+                    parts.appendAssumeCapacity(part);
+                }
+            }
+
+            if (parts.items.len == 0) {
+                parts.deinit();
+
+                return head;
+            }
+
+            return Expr.init(
+                E.Template,
+                E.Template{
+                    .tag = null,
+                    .parts = parts.items,
+                    .head = head.data.e_string.*,
+                },
+                loc,
+            );
+        }
     };
 
     pub const RegExp = struct {
@@ -2089,12 +2235,17 @@ pub const E = struct {
         no: ExprNodeIndex,
     };
 
-    pub const Require = struct {
+    pub const RequireString = struct {
         import_record_index: u32 = 0,
+
+        unwrapped_id: u32 = std.math.maxInt(u32),
     };
 
-    pub const RequireOrRequireResolve = struct {
+    pub const RequireResolveString = struct {
         import_record_index: u32 = 0,
+
+        /// TODO:
+        close_paren_loc: logger.Loc = logger.Loc.Empty,
     };
 
     pub const Import = struct {
@@ -3237,11 +3388,11 @@ pub const Expr = struct {
                     },
                 };
             },
-            E.RequireOrRequireResolve => {
+            E.RequireResolveString => {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_require_or_require_resolve = st,
+                        .e_require_resolve_string = st,
                     },
                 };
             },
@@ -3257,11 +3408,11 @@ pub const Expr = struct {
                     },
                 };
             },
-            E.Require => {
+            E.RequireString => {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_require = st,
+                        .e_require_string = st,
                     },
                 };
             },
@@ -3575,11 +3726,11 @@ pub const Expr = struct {
                     },
                 };
             },
-            E.RequireOrRequireResolve => {
+            E.RequireResolveString => {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_require_or_require_resolve = st,
+                        .e_require_resolve_string = st,
                     },
                 };
             },
@@ -3591,11 +3742,11 @@ pub const Expr = struct {
                     },
                 };
             },
-            E.Require => {
+            E.RequireString => {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_require = st,
+                        .e_require_string = st,
                     },
                 };
             },
@@ -3646,11 +3797,11 @@ pub const Expr = struct {
         e_await,
         e_yield,
         e_if,
-        e_require_or_require_resolve,
+        e_require_resolve_string,
         e_import,
         e_this,
         e_class,
-        e_require,
+        e_require_string,
 
         e_commonjs_export_identifier,
 
@@ -3711,11 +3862,11 @@ pub const Expr = struct {
                 .e_await => writer.writeAll("await"),
                 .e_yield => writer.writeAll("yield"),
                 .e_if => writer.writeAll("if"),
-                .e_require_or_require_resolve => writer.writeAll("require_or_require_resolve"),
+                .e_require_resolve_string => writer.writeAll("require_or_require_resolve"),
                 .e_import => writer.writeAll("import"),
                 .e_this => writer.writeAll("this"),
                 .e_class => writer.writeAll("class"),
-                .e_require => writer.writeAll("require"),
+                .e_require_string => writer.writeAll("require"),
                 else => writer.writeAll(@tagName(tag)),
             };
         }
@@ -4054,9 +4205,9 @@ pub const Expr = struct {
                 },
             }
         }
-        pub fn isRequireOrRequireResolve(self: Tag) bool {
+        pub fn isRequireResolveString(self: Tag) bool {
             switch (self) {
-                .e_require_or_require_resolve => {
+                .e_require_resolve_string => {
                     return true;
                 },
                 else => {
@@ -4303,8 +4454,8 @@ pub const Expr = struct {
         e_big_int: *E.BigInt,
         e_string: *E.String,
 
-        e_require: E.Require,
-        e_require_or_require_resolve: E.RequireOrRequireResolve,
+        e_require_string: E.RequireString,
+        e_require_resolve_string: E.RequireResolveString,
 
         e_missing: E.Missing,
         e_this: E.This,
@@ -4798,6 +4949,21 @@ pub const S = struct {
     pub const ExportDefault = struct {
         default_name: LocRef, // value may be a SFunction or SClass
         value: StmtOrExpr,
+
+        pub fn canBeMovedAround(self: ExportDefault) bool {
+            return switch (self.value) {
+                .expr => |e| switch (e.data) {
+                    .e_class => |class| class.extends == null,
+                    .e_arrow, .e_function => true,
+                    else => e.canBeConstValue(),
+                },
+                .stmt => |s| switch (s.data) {
+                    .s_class => |class| class.class.extends == null,
+                    .s_function => true,
+                    else => false,
+                },
+            };
+        }
     };
 
     pub const Enum = struct {
@@ -4859,7 +5025,6 @@ pub const S = struct {
     pub const With = struct {
         value: ExprNodeIndex,
         body: StmtNodeIndex,
-        body_loc: logger.Loc,
     };
 
     pub const Try = struct {
@@ -4911,6 +5076,8 @@ pub const S = struct {
         // The TypeScript compiler doesn't generate code for "import foo = bar"
         // statements where the import is never used.
         was_ts_import_equals: bool = false,
+
+        was_commonjs_export: bool = false,
 
         pub const Kind = enum(u2) {
             k_var,
@@ -5301,6 +5468,8 @@ pub const Ast = struct {
     /// Only populated when bundling
     platform: bun.options.Platform = .browser,
 
+    const_values: ConstValuesMap = .{},
+
     pub const CommonJSNamedExport = struct {
         loc_ref: LocRef,
         needs_decl: bool = true,
@@ -5309,6 +5478,7 @@ pub const Ast = struct {
 
     pub const NamedImports = std.ArrayHashMap(Ref, NamedImport, RefHashCtx, true);
     pub const NamedExports = bun.StringArrayHashMap(NamedExport);
+    pub const ConstValuesMap = std.ArrayHashMapUnmanaged(Ref, Expr, RefHashCtx, false);
 
     pub fn initTest(parts: []Part) Ast {
         return Ast{
@@ -5368,6 +5538,10 @@ pub const ExportsKind = enum {
     // module are allowed. Direct named imports reference the corresponding export
     // directly. Other imports go through property accesses on "exports".
     esm_with_dynamic_fallback,
+
+    // Like "esm_with_dynamic_fallback", but the module was originally a CommonJS
+    // module.
+    esm_with_dynamic_fallback_from_cjs,
 
     pub fn isDynamic(self: ExportsKind) bool {
         return self == .esm_with_dynamic_fallback or self == .cjs;
@@ -5539,6 +5713,8 @@ pub const Part = struct {
         dirname_filename,
         bun_plugin,
         bun_test,
+        dead_due_to_inlining,
+        commonjs_named_export,
     };
 
     pub const SymbolUseMap = std.ArrayHashMapUnmanaged(Ref, Symbol.Use, RefHashCtx, false);
@@ -6519,8 +6695,8 @@ pub const Macro = struct {
                 .e_if => |value| {
                     return JSNode{ .loc = this.loc, .data = .{ .e_if = value } };
                 },
-                .e_require_or_require_resolve => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_require_or_require_resolve = value } };
+                .e_require_resolve_string => |value| {
+                    return JSNode{ .loc = this.loc, .data = .{ .e_require_resolve_string = value } };
                 },
                 .e_import => |value| {
                     return JSNode{ .loc = this.loc, .data = .{ .e_import = value } };
@@ -6531,8 +6707,8 @@ pub const Macro = struct {
                 .e_class => |value| {
                     return JSNode{ .loc = this.loc, .data = .{ .e_class = value } };
                 },
-                .e_require => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_require = value } };
+                .e_require_string => |value| {
+                    return JSNode{ .loc = this.loc, .data = .{ .e_require_string = value } };
                 },
                 .e_missing => |value| {
                     return JSNode{ .loc = this.loc, .data = .{ .e_missing = value } };
@@ -6638,8 +6814,8 @@ pub const Macro = struct {
                 .e_if => |value| {
                     return Expr{ .loc = this.loc, .data = .{ .e_if = value } };
                 },
-                .e_require_or_require_resolve => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_require_or_require_resolve = value } };
+                .e_require_resolve_string => |value| {
+                    return Expr{ .loc = this.loc, .data = .{ .e_require_resolve_string = value } };
                 },
                 .e_import => |value| {
                     return Expr{ .loc = this.loc, .data = .{ .e_import = value } };
@@ -6650,8 +6826,8 @@ pub const Macro = struct {
                 .e_class => |value| {
                     return Expr{ .loc = this.loc, .data = .{ .e_class = value } };
                 },
-                .e_require => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_require = value } };
+                .e_require_string => |value| {
+                    return Expr{ .loc = this.loc, .data = .{ .e_require_string = value } };
                 },
                 .e_missing => |value| {
                     return Expr{ .loc = this.loc, .data = .{ .e_missing = value } };
@@ -6750,8 +6926,8 @@ pub const Macro = struct {
             s_block: *S.Block,
 
             e_reg_exp: *E.RegExp,
-            e_require_or_require_resolve: E.RequireOrRequireResolve,
-            e_require: E.Require,
+            e_require_resolve_string: E.RequireResolveString,
+            e_require_string: E.RequireString,
 
             g_property: *G.Property,
 
@@ -6798,11 +6974,11 @@ pub const Macro = struct {
             e_await,
             e_yield,
             e_if,
-            e_require_or_require_resolve,
+            e_require_resolve_string,
             e_import,
             e_this,
             e_class,
-            e_require,
+            e_require_string,
             s_import,
             s_block,
 
@@ -6865,7 +7041,7 @@ pub const Macro = struct {
                 .{ "dynamic", Tag.e_import },
                 .{ "this", Tag.e_this },
                 .{ "class", Tag.e_class },
-                .{ "require", Tag.e_require },
+                .{ "require", Tag.e_require_string },
                 .{ "import", Tag.s_import },
                 .{ "property", Tag.g_property },
                 .{ "block", Tag.s_block },
@@ -6908,11 +7084,11 @@ pub const Macro = struct {
                 list.set(Tag.e_await, Expr.Tag.e_await);
                 list.set(Tag.e_yield, Expr.Tag.e_yield);
                 list.set(Tag.e_if, Expr.Tag.e_if);
-                list.set(Tag.e_require_or_require_resolve, Expr.Tag.e_require_or_require_resolve);
+                list.set(Tag.e_require_resolve_string, Expr.Tag.e_require_resolve_string);
                 list.set(Tag.e_import, Expr.Tag.e_import);
                 list.set(Tag.e_this, Expr.Tag.e_this);
                 list.set(Tag.e_class, Expr.Tag.e_class);
-                list.set(Tag.e_require, Expr.Tag.e_require);
+                list.set(Tag.e_require_string, Expr.Tag.e_require_string);
                 break :brk list;
             };
 
@@ -6948,11 +7124,11 @@ pub const Macro = struct {
                 list.set(Expr.Tag.e_await, Tag.e_await);
                 list.set(Expr.Tag.e_yield, Tag.e_yield);
                 list.set(Expr.Tag.e_if, Tag.e_if);
-                list.set(Expr.Tag.e_require_or_require_resolve, Tag.e_require_or_require_resolve);
+                list.set(Expr.Tag.e_require_resolve_string, Tag.e_require_resolve_string);
                 list.set(Expr.Tag.e_import, Tag.e_import);
                 list.set(Expr.Tag.e_this, Tag.e_this);
                 list.set(Expr.Tag.e_class, Tag.e_class);
-                list.set(Expr.Tag.e_require, Tag.e_require);
+                list.set(Expr.Tag.e_require_string, Tag.e_require_string);
                 break :brk list;
             };
 
@@ -7710,7 +7886,7 @@ pub const Macro = struct {
                         // Tag.e_import => {},
 
                         // Tag.e_class => {},
-                        // Tag.e_require => {},
+                        // Tag.e_require_string => {},
                         // Tag.s_import => {},
 
                         // Tag.s_block => {},
@@ -9385,7 +9561,7 @@ pub const UseDirective = enum {
 //     printmem("E.Await:                   {d} bits\n", .{@bitSizeOf(E.Await)});
 //     printmem("E.Yield:                   {d} bits\n", .{@bitSizeOf(E.Yield)});
 //     printmem("E.If:                      {d} bits\n", .{@bitSizeOf(E.If)});
-//     printmem("E.RequireOrRequireResolve: {d} bits\n", .{@bitSizeOf(E.RequireOrRequireResolve)});
+//     printmem("E.RequireResolveString: {d} bits\n", .{@bitSizeOf(E.RequireResolveString)});
 //     printmem("E.Import:                  {d} bits\n", .{@bitSizeOf(E.Import)});
 //     printmem("----------Expr:            {d} bits\n", .{@bitSizeOf(Expr)});
 // }

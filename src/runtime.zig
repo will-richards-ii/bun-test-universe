@@ -296,6 +296,8 @@ pub const Runtime = struct {
 
         commonjs_named_exports: bool = true,
 
+        minify_syntax: bool = false,
+
         /// Instead of jsx("div", {}, void 0)
         /// ->
         /// {
@@ -323,6 +325,18 @@ pub const Runtime = struct {
         hoist_bun_plugin: bool = false,
 
         dont_bundle_twice: bool = false,
+
+        /// This is a list of packages which even when require() is used, we will
+        /// instead convert to ESM import statements.
+        ///
+        /// This is not normally a safe transformation.
+        ///
+        /// So we have a list of packages which we know are safe to do this with.
+        unwrap_commonjs_packages: []const string = &.{},
+
+        pub fn shouldUnwrapRequire(this: *const Features, package_name: string) bool {
+            return package_name.len > 0 and strings.indexAny(this.unwrap_commonjs_packages, package_name) != null;
+        }
 
         pub const ReplaceableExport = union(enum) {
             delete: void,
